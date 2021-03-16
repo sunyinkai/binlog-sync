@@ -2,8 +2,8 @@ package main
 
 import (
 	"database/sql"
-	_ "database/sql/driver"
 	"fmt"
+	_ "github.com/go-sql-driver/mysql"
 	"io/ioutil"
 	"log"
 	"reflect"
@@ -17,11 +17,14 @@ type DBHelper struct {
 
 func NewDBHelper(path string) *DBHelper {
 	DB, err := sql.Open("mysql", path)
+	DB.SetConnMaxLifetime(200)
+	DB.SetMaxIdleConns(20)
 	if err != nil {
+		log.Fatal("open my sql error,%s", err.Error())
 		return nil
 	}
 	if err := DB.Ping(); err != nil {
-		log.Fatal("connect to db,error")
+		log.Fatal("connect to db,error", err.Error())
 	}
 	log.Println("connect to db success")
 	return &DBHelper{DB: DB}
@@ -34,7 +37,7 @@ func (d *DBHelper) CreateTable(sqlFilePath string) error {
 	}
 	sqlTable := string(sqlBytes)
 	_, err = d.DB.Exec(sqlTable)
-	log.Printf("CreateTable %s return %v", sqlTable, err)
+	log.Printf("CreateTable %s error %v", sqlTable, err)
 	if err != nil {
 		return err
 	}
@@ -99,6 +102,7 @@ func (d *DBHelper) GenBatchInsertSql(tableName string, values []interface{}) str
 	return sqlStr
 }
 
+//删除tableName中,主键为keys的数据
 func (d *DBHelper) GenBatchDeleteSql(tableName string, keys []int) string {
 	if len(keys) == 0 {
 		return ""
@@ -112,7 +116,11 @@ func (d *DBHelper) GenBatchDeleteSql(tableName string, keys []int) string {
 		vals = append(vals, strconv.Itoa(v)...)
 	}
 	vals = append(vals, ')')
-	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE uid in %s)", tableName, string(vals))
+	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE uid in %s", tableName, string(vals))
 	log.Printf("GenDeleteSql:%s", sqlStr)
 	return sqlStr
+}
+
+func (d *DBHelper) HasTable(tableName string) bool {
+	return true
 }

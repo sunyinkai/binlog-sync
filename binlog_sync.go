@@ -16,13 +16,13 @@ type BinLogSync struct {
 	csvFile     string
 	logReader   *LogReader
 	dbHelper    *DBHelper
-	mp          map[int]table.User
-	nowPos      int
+	//当作缓存
+	mp map[int]table.User
+	//用于记录同步的进度
+	nowPos     int
+	beforePos  int
+	failedLine int
 }
-
-const (
-	linesPerRead = 1000
-)
 
 func NewBinLogSync(dataSqlFile, posSqlFile, dbPath, csvFile string) *BinLogSync {
 	logReader := NewLogReader(csvFile)
@@ -33,21 +33,48 @@ func NewBinLogSync(dataSqlFile, posSqlFile, dbPath, csvFile string) *BinLogSync 
 	if dbHelper == nil {
 		log.Fatal("NewDBHelper error")
 	}
-	dbHelper.CreateTable(dataSqlFile)
-	dbHelper.CreateTable(posSqlFile)
-	getPosSql := fmt.Sprintf("select * FROM `%s` WHERE table_name = '%s'", posTable, dataTable)
-	rows, err := dbHelper.DB.Query(getPosSql) //CheckAndCreate
-	if err == nil {
-		log.Fatal("GetPosSql error")
+	//CheckAndCreate
+	if !dbHelper.HasTable(dataTable) {
+		dbHelper.CreateTable(dataSqlFile)
 	}
-	var lineCnt int
-	for rows != nil && rows.Next() {
-		var tableName string
-		err = rows.Scan(&lineCnt, &tableName)
+	if !dbHelper.HasTable(posTable) {
+		dbHelper.CreateTable(posSqlFile)
+	}
+
+	//获取上次的同步进度
+	func() { //如果db中还没有这个表的数据,那么就插入一条记录
+		getPosSql := fmt.Sprintf("select * FROM `%s` WHERE table_name = '%s'", posTable, dataTable)
+		rows, err := dbHelper.DB.Query(getPosSql)
+		defer rows.Close()
 		if err != nil {
-			log.Fatal("Read LineCnt From DB error")
+			log.Fatal("GetPosSql error,%s", err.Error())
 		}
+		if rows == nil || !rows.Next() {
+			s := make([]interface{}, 0)
+			s = append(s, table.SyncPos{TableName: dataTable, LineCnt: 0})
+			sqlStr := dbHelper.GenBatchInsertSql(posTable, s)
+			dbHelper.DB.Exec(sqlStr)
+		}
+	}()
+	getDataSyncPos := func() int {
+		var nowPos int
+		getPosSql := fmt.Sprintf("select * FROM `%s` WHERE table_name = '%s'", posTable, dataTable)
+		rows, err := dbHelper.DB.Query(getPosSql)
+		defer rows.Close()
+		if err != nil {
+			log.Fatal("GetPosSql error,%s", err.Error())
+		}
+		for rows != nil && rows.Next() {
+			var tableName string
+			err = rows.Scan(&tableName, &nowPos)
+			if err != nil {
+				log.Fatal("Read LineCnt From DB error %s", err.Error())
+			}
+			log.Printf("Read %s from pos table ok,nowPos:%d", tableName, nowPos)
+		}
+		return nowPos
 	}
+	nowPos := getDataSyncPos()
 
 	return &BinLogSync{
 		dataSqlFile: dataSqlFile,
@@ -56,7 +83,9 @@ func NewBinLogSync(dataSqlFile, posSqlFile, dbPath, csvFile string) *BinLogSync 
 		logReader:   logReader,
 		dbHelper:    dbHelper,
 		mp:          make(map[int]table.User),
-		nowPos:      lineCnt}
+		nowPos:      nowPos,
+		beforePos:   nowPos,
+		failedLine:  0}
 }
 
 func (bls *BinLogSync) flush(t string) bool {
@@ -79,7 +108,6 @@ func (bls *BinLogSync) flush(t string) bool {
 	}
 	//清空cache
 	bls.mp = make(map[int]table.User)
-
 	//生成更新pos表的sql语句
 	updatePosSql := fmt.Sprintf("UPDATE `%s` SET line_cnt=%d WHERE table_name='%s';", posTable, bls.nowPos, dataTable)
 	//更新数据库以及pos，使用事务，原子写入
@@ -89,10 +117,12 @@ func (bls *BinLogSync) flush(t string) bool {
 	}
 	_, err = tx.Exec(sqlStr)
 	if err != nil {
+		tx.Rollback()
 		return false
 	}
 	_, err = tx.Exec(updatePosSql)
 	if err != nil {
+		tx.Rollback()
 		return false
 	}
 	err = tx.Commit()
@@ -102,10 +132,15 @@ func (bls *BinLogSync) flush(t string) bool {
 		return true
 	}
 }
+
+const (
+	LinesPerRead = 1000 //每次从csv文件中读取多少行数据
+)
+
 func (bls *BinLogSync) Resume() {
 	nowLine := 0
-	for nowLine+linesPerRead < bls.nowPos {
-		lines, err := bls.logReader.ReadLines(linesPerRead)
+	for nowLine+LinesPerRead < bls.nowPos {
+		lines, err := bls.logReader.ReadLines(LinesPerRead)
 		if err != nil && err != io.EOF {
 			log.Fatal("Resume error,exit")
 		}
@@ -121,10 +156,14 @@ func (bls *BinLogSync) Start() {
 	bls.Resume() //恢复上次的进度
 
 	bContinue := true
-	prevModify := ""
+	prevType := ""
+	const (
+		MaxLineOneOperate = 100 //限制一次操作最多能处理多少行,达到最大行后强行flush
+	)
+	forceFlush := MaxLineOneOperate
 	for {
 		//读取csv文件并解析
-		lines, err := bls.logReader.ReadLines(linesPerRead)
+		lines, err := bls.logReader.ReadLines(LinesPerRead)
 		bls.nowPos += len(lines)
 		if err != nil {
 			bContinue = false
@@ -135,24 +174,24 @@ func (bls *BinLogSync) Start() {
 			elements := strings.Split(line, ",")
 			n := len(elements)
 			if n != colCnt+1 {
+				bls.failedLine++
 				continue
 			}
 			var user table.User
 			ok := bls.logReader.ParseLine(line, &user)
 			if !ok {
+				bls.failedLine++
 				log.Printf("ParseLine %s return false", line)
 				continue
 			}
-			bls.mp[user.Uid] = user
-			if prevModify == "" { //第一次进入循环
-				prevModify = elements[n-1]
+			if prevType == "" { //第一次进入循环
+				prevType = elements[n-1]
 			}
-			if elements[n-1] == prevModify {
-				bls.mp[user.Uid] = user
-			} else {
+			forceFlush--
+			if elements[n-1] != prevType || forceFlush == 0 {
 				ok := false
 				for tryTime := 0; tryTime < 3; tryTime++ {
-					ok = bls.flush(prevModify)
+					ok = bls.flush(prevType)
 					if !ok {
 						time.Sleep(5 * time.Second)
 					} else {
@@ -162,16 +201,20 @@ func (bls *BinLogSync) Start() {
 				if !ok {
 					log.Fatal("flush DB error 3 times,exit")
 				}
-				prevModify = elements[n-1]
+				prevType = elements[n-1]
+				forceFlush = MaxLineOneOperate
 			}
+			bls.mp[user.Uid] = user
 		}
 
 		if !bContinue {
 			if err == io.EOF {
-				log.Println("BinLogSync Success!Exit 0")
+				bls.flush(prevType) //退出循环前强制刷新一次
+				break
 			} else {
 				log.Fatalf("BinLogSync Error %s", err.Error())
 			}
 		}
 	}
+	log.Printf("BinLogSync Finish! success:%d line,failed:%d line!", bls.nowPos-bls.beforePos-bls.failedLine, bls.failedLine)
 }
