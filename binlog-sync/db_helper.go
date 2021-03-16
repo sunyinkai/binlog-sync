@@ -116,7 +116,7 @@ func (d *DBHelper) GenBatchDeleteSql(tableName string, keys []int) string {
 		vals = append(vals, strconv.Itoa(v)...)
 	}
 	vals = append(vals, ')')
-	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE uid in %s)", tableName, string(vals))
+	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE uid in %s", tableName, string(vals))
 	log.Printf("GenDeleteSql:%s", sqlStr)
 	return sqlStr
 }

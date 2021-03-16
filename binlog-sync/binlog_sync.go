@@ -117,10 +117,12 @@ func (bls *BinLogSync) flush(t string) bool {
 	}
 	_, err = tx.Exec(sqlStr)
 	if err != nil {
+		tx.Rollback()
 		return false
 	}
 	_, err = tx.Exec(updatePosSql)
 	if err != nil {
+		tx.Rollback()
 		return false
 	}
 	err = tx.Commit()
